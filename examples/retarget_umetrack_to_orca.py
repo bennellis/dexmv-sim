@@ -9,6 +9,10 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import least_squares
 from scipy import signal
+try:
+    import yaml
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    yaml = None
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -33,8 +37,14 @@ DEFAULT_UME_TO_ORCA_Y_OFFSET_DEG = 90.0
 DEFAULT_UME_TO_ORCA_Z_OFFSET_DEG = -90.0
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("Retarget HOT3D UME-TRACK trajectory to ORCA using ORCA URDF kinematics")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional JSON or YAML config file. CLI flags override config values.",
+    )
     parser.add_argument("--recording-dir", type=Path, required=True)
     parser.add_argument("--umetrack-jsonl", type=str, default="umetrack_hand_pose_trajectory.jsonl")
     parser.add_argument("--umetrack-profile-json", type=str, default="umetrack_hand_user_profile.json")
@@ -119,12 +129,113 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-timestamp-ns", type=int, default=None)
     parser.add_argument("--end-timestamp-ns", type=int, default=None)
+    parser.add_argument(
+        "--consolidate-close-timestamps-ns",
+        type=int,
+        default=0,
+        help=(
+            "Collapse consecutive UME-TRACK timestamps separated by at most this many nanoseconds "
+            "before frame-based slicing. Use 1000000 to consolidate the HOT3D near-duplicate <1 ms groups."
+        ),
+    )
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=-1)
     parser.add_argument("--output-pkl", type=Path, default=None)
     parser.add_argument("--output-npz", type=Path, default=None)
     parser.add_argument("--verbose-every", type=int, default=50)
-    return parser.parse_args()
+    return parser
+
+
+def _action_expects_path(action: argparse.Action) -> bool:
+    if getattr(action, "type", None) is Path:
+        return True
+    return isinstance(getattr(action, "default", None), Path)
+
+
+def _config_value_to_argv(action: argparse.Action, value, config_dir: Path) -> list[str]:
+    option_strings = list(getattr(action, "option_strings", []))
+    if not option_strings or value is None:
+        return []
+
+    if isinstance(action, argparse.BooleanOptionalAction):
+        positive = next((opt for opt in option_strings if opt.startswith("--") and not opt.startswith("--no-")), option_strings[0])
+        negative = next((opt for opt in option_strings if opt.startswith("--no-")), None)
+        if bool(value):
+            return [positive]
+        return [negative] if negative is not None else []
+
+    if action.nargs == 0 and isinstance(getattr(action, "default", None), bool):
+        desired = bool(value)
+        if desired == bool(action.default):
+            return []
+        preferred = next((opt for opt in option_strings if opt.startswith("--")), option_strings[0])
+        return [preferred]
+
+    preferred = next((opt for opt in option_strings if opt.startswith("--") and not opt.startswith("--no-")), option_strings[0])
+
+    def _normalize_scalar(v):
+        if _action_expects_path(action):
+            path_value = Path(v)
+            if not path_value.is_absolute():
+                path_value = (config_dir / path_value).resolve()
+            return str(path_value)
+        return str(v)
+
+    if isinstance(value, (list, tuple)):
+        return [preferred, *[_normalize_scalar(v) for v in value]]
+    return [preferred, _normalize_scalar(value)]
+
+
+def _load_config_dict(config_path: Path) -> dict:
+    suffix = config_path.suffix.lower()
+    with config_path.open("r", encoding="utf-8") as f:
+        if suffix == ".json":
+            raw = json.load(f)
+        elif suffix in {".yaml", ".yml"}:
+            if yaml is None:
+                raise ImportError(
+                    "YAML config support requires PyYAML. Install it in the active environment or use a JSON config."
+                )
+            raw = yaml.safe_load(f)
+        else:
+            raise ValueError(f"Unsupported config file type for {config_path}. Use .json, .yaml, or .yml.")
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config file must contain a mapping/object at the top level: {config_path}")
+    return raw
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=Path, default=None)
+    config_args, _ = config_parser.parse_known_args(raw_argv)
+    if config_args.config is not None:
+        config_path = config_args.config.resolve()
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        raw = _load_config_dict(config_path)
+        action_by_dest = {
+            action.dest: action
+            for action in parser._actions
+            if getattr(action, "dest", None) not in {None, argparse.SUPPRESS, "help"}
+        }
+        config_argv: list[str] = []
+        ignored_keys: list[str] = []
+        for key, value in raw.items():
+            if key == "config":
+                continue
+            action = action_by_dest.get(str(key))
+            if action is None:
+                ignored_keys.append(str(key))
+                continue
+            config_argv.extend(_config_value_to_argv(action, value, config_path.parent))
+        if ignored_keys:
+            print(f"[WARN] Ignoring unknown config key(s): {', '.join(sorted(ignored_keys))}", flush=True)
+        raw_argv = config_argv + raw_argv
+
+    return parser.parse_args(raw_argv)
 
 
 def load_tip_idx_by_finger(path: Path, hand_side: str) -> dict[str, int]:
@@ -136,20 +247,60 @@ def load_tip_idx_by_finger(path: Path, hand_side: str) -> dict[str, int]:
     return {k: int(v) for k, v in raw.items()}
 
 
+def filter_timestamps_by_range(timestamps: list[int], start_ns: int | None, end_ns: int | None) -> list[int]:
+    out = list(timestamps)
+    if start_ns is not None:
+        out = [ts for ts in out if ts >= int(start_ns)]
+    if end_ns is not None:
+        out = [ts for ts in out if ts <= int(end_ns)]
+    return out
+
+
+def consolidate_close_timestamps(
+    timestamps: list[int], threshold_ns: int
+) -> tuple[list[int], dict[str, int]]:
+    out = list(timestamps)
+    threshold_ns = int(threshold_ns)
+    if threshold_ns <= 0 or len(out) <= 1:
+        return out, {
+            "input_count": len(out),
+            "output_count": len(out),
+            "removed_count": 0,
+            "group_count": len(out),
+            "max_group_size": 1 if out else 0,
+        }
+
+    consolidated = [out[0]]
+    group_count = 1
+    group_size = 1
+    max_group_size = 1
+    prev_ts = out[0]
+    for ts in out[1:]:
+        if int(ts) - int(prev_ts) <= threshold_ns:
+            group_size += 1
+            max_group_size = max(max_group_size, group_size)
+        else:
+            consolidated.append(ts)
+            group_count += 1
+            group_size = 1
+        prev_ts = ts
+    return consolidated, {
+        "input_count": len(out),
+        "output_count": len(consolidated),
+        "removed_count": len(out) - len(consolidated),
+        "group_count": group_count,
+        "max_group_size": max_group_size,
+    }
+
+
 def apply_timestamp_filters(
     timestamps: list[int],
-    start_ns: int | None,
-    end_ns: int | None,
     start_frame: int,
     stride: int,
     num_frames: int,
     max_frames: int,
 ) -> list[int]:
     out = list(timestamps)
-    if start_ns is not None:
-        out = [ts for ts in out if ts >= int(start_ns)]
-    if end_ns is not None:
-        out = [ts for ts in out if ts <= int(end_ns)]
     if not out:
         return out
     if start_frame < 0:
@@ -636,11 +787,18 @@ def main() -> None:
     if args.hand_id not in hand_ids:
         raise ValueError(f"--hand-id={args.hand_id} not found. Available hand ids: {hand_ids}")
 
-    timestamps = sorted(ts for ts, hands in hand_traj_by_ts.items() if args.hand_id in hands)
-    timestamps = apply_timestamp_filters(
-        timestamps,
+    raw_timestamps = sorted(ts for ts, hands in hand_traj_by_ts.items() if args.hand_id in hands)
+    timestamps = filter_timestamps_by_range(
+        raw_timestamps,
         start_ns=args.start_timestamp_ns,
         end_ns=args.end_timestamp_ns,
+    )
+    timestamps, consolidation_stats = consolidate_close_timestamps(
+        timestamps,
+        threshold_ns=int(args.consolidate_close_timestamps_ns),
+    )
+    timestamps = apply_timestamp_filters(
+        timestamps,
         start_frame=int(args.start_frame),
         stride=args.stride,
         num_frames=int(args.num_frames),
@@ -689,6 +847,13 @@ def main() -> None:
         f"hand_side={args.hand_side} orca_side={args.orca_side}",
         flush=True,
     )
+    if int(args.consolidate_close_timestamps_ns) > 0:
+        print(
+            f"[INFO] Timestamp consolidation: threshold_ns={int(args.consolidate_close_timestamps_ns)} "
+            f"windowed_frames={consolidation_stats['input_count']} consolidated_frames={consolidation_stats['output_count']} "
+            f"removed={consolidation_stats['removed_count']} max_group_size={consolidation_stats['max_group_size']}",
+            flush=True,
+        )
     print(f"[INFO] UME-TRACK tip map: {tip_idx_by_finger}", flush=True)
     print(f"[INFO] ORCA URDF: {orca_urdf}", flush=True)
     print(f"[INFO] Target set: {args.target_set}", flush=True)

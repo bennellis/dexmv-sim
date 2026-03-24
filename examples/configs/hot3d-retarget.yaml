@@ -1,0 +1,19 @@
+# HOT3D -> ORCA retarget config for P0001_15c4300c, right hand.
+# CLI flags still override values in this file.
+
+recording_dir: /home/cvg/Documents/dexterous_manipulation/HOT3D/dataset/P0001_15c4300c
+hand_id: "1"
+hand_side: right
+orca_side: right
+
+target_set: palm_mids_tips
+start_frame: 0
+num_frames: 10000
+
+# Collapse HOT3D near-duplicate multi-view timestamps into one effective frame.
+consolidate_close_timestamps_ns: 1000000
+
+output_npz: /home/cvg/Documents/dexterous_manipulation/dexterous_manipulation/retarget_trajectories/retarget_P0001_15c4300c_cons.npz
+
+print_joint_limits: false
+optimize_palm_delta: false
