@@ -14,6 +14,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in some environments
     yaml = None
 
+_CONFIG_VARIABLE_KEYS = {"root", "root_dir", "workspace_root"}
+
 
 SCRIPT_PATH = Path(__file__).resolve()
 DEXMV_DIR = SCRIPT_PATH.parents[1]
@@ -204,6 +206,21 @@ def _load_config_dict(config_path: Path) -> dict:
     return raw
 
 
+def _expand_config_variables(value, variables: dict[str, str]):
+    if isinstance(value, str):
+        expanded = value
+        for key, replacement in variables.items():
+            expanded = expanded.replace(f"${{{key}}}", replacement)
+        return expanded
+    if isinstance(value, list):
+        return [_expand_config_variables(item, variables) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_expand_config_variables(item, variables) for item in value)
+    if isinstance(value, dict):
+        return {k: _expand_config_variables(v, variables) for k, v in value.items()}
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -216,6 +233,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if not config_path.is_file():
             raise FileNotFoundError(f"Config file not found: {config_path}")
         raw = _load_config_dict(config_path)
+        variables = {
+            str(key): str(value)
+            for key, value in raw.items()
+            if str(key) in _CONFIG_VARIABLE_KEYS and isinstance(value, (str, int, float, Path))
+        }
         action_by_dest = {
             action.dest: action
             for action in parser._actions
@@ -224,8 +246,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         config_argv: list[str] = []
         ignored_keys: list[str] = []
         for key, value in raw.items():
-            if key == "config":
+            if key == "config" or key in _CONFIG_VARIABLE_KEYS:
                 continue
+            value = _expand_config_variables(value, variables)
             action = action_by_dest.get(str(key))
             if action is None:
                 ignored_keys.append(str(key))
