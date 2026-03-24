@@ -17,5 +17,7 @@ consolidate_close_timestamps_ns: 1000000
 
 output_npz: ${root}/dexterous_manipulation/retarget_trajectories/retarget_P0001_15c4300c_cons.npz
 
+reg_weight: 0.001
+
 print_joint_limits: false
 optimize_palm_delta: false

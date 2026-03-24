@@ -16,7 +16,7 @@ from dexterous_manipulation.utils.hot3d_models import UmeTrackHandModel
 
 
 FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
-UME_PALM_CENTER_OFFSET_LOCAL = np.array([0.04, 0.0, 0.01], dtype=np.float64)
+UME_PALM_CENTER_OFFSET_LOCAL = np.array([0.02, 0.0, 0.01], dtype=np.float64)
 
 
 @dataclass(frozen=True)
