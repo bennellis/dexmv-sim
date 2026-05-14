@@ -16,7 +16,10 @@ from dexterous_manipulation.utils.hot3d_models import UmeTrackHandModel
 
 
 FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
-UME_PALM_CENTER_OFFSET_LOCAL = np.array([0.02, 0.0, 0.01], dtype=np.float64)
+UME_PALM_CENTER_OFFSET_LOCAL_BY_SIDE = {
+    "right": np.array([0.03, 0.0, 0.01], dtype=np.float64),
+    "left": np.array([-0.03, 0.0, 0.0], dtype=np.float64),
+}
 
 
 @dataclass(frozen=True)
@@ -132,7 +135,10 @@ class UMETrackHandAdapter:
         return np.mean(np.asarray(local_joint_positions, dtype=np.float64)[finger_map.palm_base_indices], axis=0)
 
     def _semantic_palm_center_from_local(self, local_joint_positions: np.ndarray) -> np.ndarray:
-        return self._raw_palm_center_from_local(local_joint_positions) + UME_PALM_CENTER_OFFSET_LOCAL
+        return (
+            self._raw_palm_center_from_local(local_joint_positions)
+            + np.asarray(UME_PALM_CENTER_OFFSET_LOCAL_BY_SIDE[self.hand_side], dtype=np.float64)
+        )
 
     def semantic_palm_center_local(self, joint_angles: np.ndarray) -> np.ndarray:
         local = self.joint_positions_local(joint_angles, center_at_palm=False)
